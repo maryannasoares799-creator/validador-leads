@@ -30,6 +30,7 @@ AZUL_ESCURO = "#0C447C"
 AZUL_CLARO = "#E6F1FB"
 
 ARQUIVO_HISTORICO = "historico.json"
+PASTA_RESULTADOS = "resultados"
 
 PROMPT_SISTEMA = """Você é um analista de qualidade de leads de uma plataforma de geração de leads B2B.
 Sua tarefa: para cada lead abaixo, decidir se ele está DENTRO ou FORA do foco do cliente descrito no perfil, ou se está ABERTO (mensagem sem informação suficiente para avaliar).
@@ -64,14 +65,44 @@ def carregar_historico():
         return []
 
 
-def salvar_no_historico(registro):
+def salvar_no_historico(registro, csv_bytes=None, dash_bytes=None):
     historico = carregar_historico()
     historico.insert(0, registro)
+    historico = historico[:200]
     try:
         with open(ARQUIVO_HISTORICO, "w", encoding="utf-8") as f:
-            json.dump(historico[:200], f, ensure_ascii=False)
+            json.dump(historico, f, ensure_ascii=False)
+        os.makedirs(PASTA_RESULTADOS, exist_ok=True)
+        rid = registro.get("id", "")
+        if rid and csv_bytes:
+            with open(os.path.join(PASTA_RESULTADOS, f"{rid}.csv"), "wb") as f:
+                f.write(csv_bytes)
+        if rid and dash_bytes:
+            with open(os.path.join(PASTA_RESULTADOS, f"{rid}.html"), "wb") as f:
+                f.write(dash_bytes)
     except Exception:
         pass
+
+
+def excluir_do_historico(rid):
+    historico = [h for h in carregar_historico() if h.get("id") != rid]
+    try:
+        with open(ARQUIVO_HISTORICO, "w", encoding="utf-8") as f:
+            json.dump(historico, f, ensure_ascii=False)
+        for ext in (".csv", ".html"):
+            caminho = os.path.join(PASTA_RESULTADOS, f"{rid}{ext}")
+            if os.path.exists(caminho):
+                os.remove(caminho)
+    except Exception:
+        pass
+
+
+def ler_resultado_salvo(rid, ext):
+    try:
+        with open(os.path.join(PASTA_RESULTADOS, f"{rid}{ext}"), "rb") as f:
+            return f.read()
+    except Exception:
+        return None
 
 
 # ---------- Metabase ----------
@@ -584,6 +615,7 @@ if validar:
     }
 
     salvar_no_historico({
+        "id": datetime.now().strftime("%Y%m%d%H%M%S"),
         "Data da solicitação": datetime.now().strftime("%d/%m/%Y %H:%M"),
         "Empresa": nome_empresa,
         "Chave única": chave_unica.strip(),
@@ -592,7 +624,10 @@ if validar:
         "Dentro do foco": contagem["Dentro do foco"],
         "Fora do foco": contagem["Fora do foco"],
         "Aberto": contagem["Aberto"],
-    })
+        "csv_nome": f"{base_nome} - Validado.csv",
+        "dash_nome": f"{base_nome} - Dashboard.html",
+    }, csv_bytes=st.session_state["resultado"]["csv_bytes"],
+       dash_bytes=st.session_state["resultado"]["dash_bytes"])
 
 res = st.session_state.get("resultado")
 if res:
@@ -620,6 +655,16 @@ if res:
 st.markdown("<p style='font-weight:600; margin-top:32px;'>Histórico de validações</p>", unsafe_allow_html=True)
 historico = carregar_historico()
 if historico:
+    filtro_chave = st.text_input(
+        "Buscar por chave única",
+        placeholder="Digite a chave para filtrar o histórico (ex.: 12-34567-1)",
+        key="f_filtro_hist",
+    )
+    if filtro_chave.strip():
+        alvo = filtro_chave.strip().lower()
+        historico = [h for h in historico if alvo in str(h.get("Chave única", "")).lower()]
+        if not historico:
+            st.caption("Nenhuma validação encontrada para essa chave.")
     linhas_html = ""
     for h in historico[:15]:
         linhas_html += (
@@ -651,6 +696,37 @@ if historico:
   {linhas_html}
 </table>
 """, unsafe_allow_html=True)
+    com_id = [h for h in historico if h.get("id")]
+    if com_id:
+        st.markdown("<p style='font-weight:600; margin-top:16px;'>Gerenciar uma validação</p>", unsafe_allow_html=True)
+        rotulos = {
+            f"{h['Data da solicitação']} · {h.get('Empresa', '?')} · {h.get('Leads', '?')} leads": h
+            for h in com_id[:15]
+        }
+        escolha = st.selectbox("Selecione a validação", list(rotulos.keys()), label_visibility="collapsed")
+        sel = rotulos[escolha]
+        rid = sel["id"]
+        csv_salvo = ler_resultado_salvo(rid, ".csv")
+        dash_salvo = ler_resultado_salvo(rid, ".html")
+        cg1, cg2, cg3 = st.columns(3)
+        with cg1:
+            if csv_salvo:
+                st.download_button("Baixar CSV", data=csv_salvo,
+                                   file_name=sel.get("csv_nome", f"{rid}.csv"),
+                                   mime="text/csv", use_container_width=True, key=f"hcsv_{rid}")
+            else:
+                st.caption("CSV não disponível (app reiniciou)")
+        with cg2:
+            if dash_salvo:
+                st.download_button("Baixar dashboard", data=dash_salvo,
+                                   file_name=sel.get("dash_nome", f"{rid}.html"),
+                                   mime="text/html", use_container_width=True, key=f"hdash_{rid}")
+            else:
+                st.caption("Dashboard não disponível (app reiniciou)")
+        with cg3:
+            if st.button("Excluir esta validação", use_container_width=True, key=f"hdel_{rid}"):
+                excluir_do_historico(rid)
+                st.rerun()
 else:
     st.caption("Nenhuma validação registrada ainda. As próximas aparecerão aqui com data, empresa e resultado.")
 
