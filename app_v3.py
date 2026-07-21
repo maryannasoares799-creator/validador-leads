@@ -12,9 +12,21 @@ from datetime import date, datetime, timedelta
 import requests
 import streamlit as st
 
-MODELO = "meta-llama/llama-4-scout-17b-16e-instruct"
-MODELO_RESERVA = "llama-3.3-70b-versatile"
-URL_GROQ = "https://api.groq.com/openai/v1/chat/completions"
+# Provedores gratuitos (APIs compatíveis com OpenAI). O app escolhe automaticamente:
+# se houver CEREBRAS_API_KEY nos Secrets usa Cerebras (cota diária bem maior);
+# senão usa Groq. Um serve de reserva do outro quando ambas as chaves existem.
+PROVEDORES = {
+    "cerebras": {
+        "url": "https://api.cerebras.ai/v1/chat/completions",
+        "modelo": "llama-3.3-70b",
+        "chave": "CEREBRAS_API_KEY",
+    },
+    "groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "modelo": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "chave": "GROQ_API_KEY",
+    },
+}
 TAMANHO_LOTE = 20
 MAX_TENTATIVAS = 5
 LIMITE_FONTE = 4000
@@ -332,58 +344,73 @@ def gerar_dashboard_html(empresa, chave, periodo, total, contagem):
     return html
 
 
-# ---------- IA (Groq) ----------
+# ---------- IA (Cerebras ou Groq, compatíveis com OpenAI) ----------
 
-def chamar_groq(api_key, perfil, lote):
+def provedores_ativos():
+    """Retorna a lista de provedores com chave configurada (Cerebras primeiro)."""
+    return [n for n in ("cerebras", "groq") if secret(PROVEDORES[n]["chave"])]
+
+
+def chamar_ia(perfil, lote, ordem):
+    """Tenta os provedores da lista em ordem; troca de provedor se a cota diária estourar."""
     leads_texto = "\n\n".join(
         f"LEAD id={l['id']}\nMensagem: {l['mensagem']}\nContexto extra: {l['extra']}"
         for l in lote
     )
-    corpo = {
-        "model": MODELO,
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": PROMPT_SISTEMA},
-            {"role": "user", "content": f"PERFIL DO CLIENTE:\n{perfil}\n\nLEADS A CLASSIFICAR:\n{leads_texto}"},
-        ],
-    }
+    conteudo_user = f"PERFIL DO CLIENTE:\n{perfil}\n\nLEADS A CLASSIFICAR:\n{leads_texto}"
     ultima = None
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
-        try:
-            r = requests.post(URL_GROQ, json=corpo,
-                              headers={"Authorization": f"Bearer {api_key}"}, timeout=120)
-            if r.status_code == 404:
-                corpo["model"] = MODELO_RESERVA
-                continue
-            if r.status_code == 429 or r.status_code >= 500:
-                try:
-                    espera = float(r.headers.get("retry-after", 0))
-                except (TypeError, ValueError):
-                    espera = 0
-                if espera > 300:
-                    raise RuntimeError(
-                        f"Cota diária da IA esgotada — o Groq pediu {espera/3600:.1f}h de espera. "
-                        "Renova às 21h (horário de Brasília), ou troque a GROQ_API_KEY nos Secrets "
-                        "por uma chave de outra conta para continuar agora."
-                    )
-                time.sleep(min(60, espera + 1) if espera else min(30, 5 * tentativa))
-                continue
-            r.raise_for_status()
-            texto = r.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(texto)
-            if isinstance(parsed, list):
-                return parsed
-            for v in parsed.values():
-                if isinstance(v, list):
-                    return v
-            raise ValueError("Resposta sem lista de resultados.")
-        except RuntimeError:
-            raise                      # cota diária esgotada: não adianta re-tentar
-        except Exception as e:
-            ultima = e
-            time.sleep(2)
-    raise ultima
+    esgotados = []
+    for nome in ordem:
+        cfg = PROVEDORES[nome]
+        api_key = secret(cfg["chave"])
+        corpo = {
+            "model": cfg["modelo"],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": PROMPT_SISTEMA},
+                {"role": "user", "content": conteudo_user},
+            ],
+        }
+        cota_estourou = False
+        for tentativa in range(1, MAX_TENTATIVAS + 1):
+            try:
+                r = requests.post(cfg["url"], json=corpo,
+                                  headers={"Authorization": f"Bearer {api_key}"}, timeout=120)
+                if r.status_code == 429 or r.status_code >= 500:
+                    try:
+                        espera = float(r.headers.get("retry-after", 0))
+                    except (TypeError, ValueError):
+                        espera = 0
+                    if espera > 300:      # cota diária esgotada nesse provedor
+                        esgotados.append(nome)
+                        cota_estourou = True
+                        break
+                    time.sleep(min(60, espera + 1) if espera else min(30, 5 * tentativa))
+                    continue
+                r.raise_for_status()
+                texto = r.json()["choices"][0]["message"]["content"]
+                parsed = json.loads(texto)
+                if isinstance(parsed, list):
+                    return parsed
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        return v
+                raise ValueError("Resposta sem lista de resultados.")
+            except Exception as e:
+                ultima = e
+                time.sleep(2)
+        if cota_estourou:
+            continue                      # tenta o próximo provedor da lista
+    if esgotados and len(esgotados) == len(ordem):
+        raise RuntimeError(
+            "Cota diária esgotada em todos os provedores de IA configurados "
+            f"({', '.join(esgotados)}). Renova às 21h (horário de Brasília), ou adicione "
+            "outra chave (CEREBRAS_API_KEY ou GROQ_API_KEY) nos Secrets para continuar agora."
+        )
+    if ultima:
+        raise ultima
+    raise RuntimeError("Falha desconhecida ao chamar a IA.")
 
 
 # ---------- Interface ----------
@@ -491,9 +518,9 @@ with col_btn1:
     validar = st.button("Enviar", type="primary", use_container_width=True)
 
 if validar:
-    api_key = secret("GROQ_API_KEY")
-    if not api_key:
-        st.error("Segredo GROQ_API_KEY não configurado.")
+    ordem_ia = provedores_ativos()
+    if not ordem_ia:
+        st.error("Nenhuma chave de IA configurada. Adicione CEREBRAS_API_KEY ou GROQ_API_KEY nos Secrets.")
         st.stop()
     if not secret("METABASE_URL"):
         st.error("Segredo METABASE_URL não configurado (ex.: https://metabase.ferramentademarketing.com.br).")
@@ -501,6 +528,10 @@ if validar:
     if not chave_unica.strip():
         st.error("Preencha a chave única do cliente.")
         st.stop()
+
+    nomes_ia = {"cerebras": "Cerebras", "groq": "Groq"}
+    st.caption("IA: " + " → ".join(nomes_ia[n] for n in ordem_ia)
+               + (" (reserva automática)" if len(ordem_ia) > 1 else ""))
 
     # 1. Briefing (question 286 — por chave única). Nem todo cliente tem briefing cadastrado.
     with st.spinner("Buscando briefing no Metabase..."):
@@ -612,7 +643,7 @@ if validar:
         for n in range(total_lotes):
             lote = lista[n * tamanho_lote:(n + 1) * tamanho_lote]
             try:
-                resultado = chamar_groq(api_key, perfil, lote)
+                resultado = chamar_ia(perfil, lote, ordem_ia)
             except RuntimeError as e:
                 progresso.empty()
                 st.error(str(e))       # cota diária esgotada: para tudo na hora
