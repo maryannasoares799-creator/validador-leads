@@ -171,6 +171,34 @@ def csv_anuncios_para_texto(conteudo_csv, limite=LIMITE_FONTE):
     return "\n".join(itens)[:limite]
 
 
+def extrair_nome_empresa(conteudo_csv):
+    """Procura o nome do cliente em qualquer CSV do Metabase que tenha essa coluna."""
+    try:
+        linhas = list(csv.reader(io.StringIO(conteudo_csv)))
+        if len(linhas) < 2:
+            return None
+        h = [c.strip().lower() for c in linhas[0]]
+        for cand in ("nome fantasia", "nome da empresa", "empresa"):
+            if cand in h:
+                v = linhas[1][h.index(cand)].strip()
+                if v:
+                    return v
+    except Exception:
+        pass
+    return None
+
+
+def buscar_site(url, limite=LIMITE_FONTE):
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        html = r.text
+    except Exception:
+        return ""
+    html = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html)
+    texto = re.sub(r"(?s)<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", texto).strip()[:limite]
+
+
 def csv_briefing_para_texto(conteudo_csv, limite=LIMITE_FONTE):
     """Converte o CSV do briefing (colunas longas) em texto legível para a IA."""
     linhas = list(csv.reader(io.StringIO(conteudo_csv)))
@@ -423,7 +451,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-CAMPOS_FORM = ("f_chave", "f_obs")
+CAMPOS_FORM = ("f_chave", "f_site", "f_obs")
 if st.session_state.pop("limpar_form", False):
     for k in CAMPOS_FORM:
         st.session_state.pop(k, None)
@@ -437,8 +465,12 @@ with col_c:
 with col_d:
     data_fim = st.date_input("Data fim", value=date.today(), format="DD/MM/YYYY")
 
+site = st.text_input(
+    "Site do cliente (opcional, mas importante quando não há briefing cadastrado)",
+    placeholder="https://www.sitedocliente.com.br", key="f_site",
+)
 obs = st.text_area(
-    "Outras observações (opcional)",
+    "Outras observações (opcional, mas importante quando não há briefing cadastrado)",
     placeholder="Ex.: cliente só vende máquinas (serviço, assistência, aluguel e peças = fora do foco); lote mínimo 500 peças; atende só Sul e Sudeste.",
     height=90, key="f_obs",
 )
@@ -470,7 +502,7 @@ if validar:
         st.error("Preencha a chave única do cliente.")
         st.stop()
 
-    # 1. Briefing (question 286 — por chave única)
+    # 1. Briefing (question 286 — por chave única). Nem todo cliente tem briefing cadastrado.
     with st.spinner("Buscando briefing no Metabase..."):
         try:
             csv_briefing = consultar_question(CARD_BRIEFING, [
@@ -480,24 +512,15 @@ if validar:
             st.error(f"Erro ao buscar o briefing (question {CARD_BRIEFING}): {e}")
             st.stop()
     texto_briefing = csv_briefing_para_texto(csv_briefing)
-    if not texto_briefing:
-        st.error(f'Briefing vazio para a chave "{chave_unica}". Confira se a chave está correta.')
-        st.stop()
+    briefing_ausente = not texto_briefing
+    if briefing_ausente:
+        st.warning(
+            f'Nenhum briefing cadastrado para a chave "{chave_unica}". '
+            "A IA vai se basear no site informado e nas observações do projeto — "
+            "preencha ao menos um desses dois campos para esse cliente."
+        )
 
-    # Nome da empresa extraído do próprio briefing (para arquivo e histórico)
-    nome_empresa = chave_unica.strip()
-    try:
-        _linhas_b = list(csv.reader(io.StringIO(csv_briefing)))
-        _h = [c.strip().lower() for c in _linhas_b[0]]
-        for _cand in ("nome da empresa", "nome fantasia", "empresa"):
-            if _cand in _h:
-                _v = _linhas_b[1][_h.index(_cand)].strip()
-                if _v:
-                    nome_empresa = _v
-                break
-    except Exception:
-        pass
-    st.caption(f"Cliente identificado: {nome_empresa}")
+    nome_empresa = extrair_nome_empresa(csv_briefing) or chave_unica.strip()
 
     # 2. Orçamentos (question 47)
     with st.spinner("Buscando orçamentos no Metabase..."):
@@ -515,6 +538,11 @@ if validar:
         st.error("Nenhum orçamento encontrado para essa chave única nesse período.")
         st.stop()
 
+    # Se o briefing não trouxe o nome, tenta pelos orçamentos (coluna "Nome Fantasia")
+    if nome_empresa == chave_unica.strip():
+        nome_empresa = extrair_nome_empresa(csv_orcamentos) or nome_empresa
+    st.caption(f"Cliente identificado: {nome_empresa}")
+
     # 3. Anúncios ativos (question 185 — opcional, não bloqueia se falhar)
     texto_anuncios = ""
     with st.spinner("Buscando anúncios do cliente no Metabase..."):
@@ -526,13 +554,33 @@ if validar:
         except Exception:
             st.warning("Não consegui buscar os anúncios (question 185) — prosseguindo sem eles.")
 
-    # 4. Perfil do cliente
-    perfil = f"===== BRIEFING DO CLIENTE (Metabase) =====\n{texto_briefing}"
+    # 4. Site do cliente (opcional — essencial quando não há briefing)
+    texto_site = ""
+    if site.strip():
+        with st.spinner("Lendo o site do cliente..."):
+            texto_site = buscar_site(site.strip())
+        if not texto_site:
+            st.warning("Não consegui ler o site informado — prosseguindo sem ele.")
+
+    # 5. Perfil do cliente — monta com o que houver disponível (briefing e/ou site e/ou observações)
+    partes_perfil = []
     regras_projeto = montar_regras()
     if regras_projeto:
-        perfil = f"===== OBSERVAÇÕES DO PROJETO (prioridade máxima) =====\n{regras_projeto}\n\n" + perfil
+        partes_perfil.append(f"===== OBSERVAÇÕES DO PROJETO (prioridade máxima) =====\n{regras_projeto}")
+    if texto_briefing:
+        partes_perfil.append(f"===== BRIEFING DO CLIENTE (Metabase) =====\n{texto_briefing}")
+    if texto_site:
+        partes_perfil.append(f"===== SITE DO CLIENTE ({site.strip()}) =====\n{texto_site}")
     if texto_anuncios:
-        perfil += f"\n\n===== ANÚNCIOS ATIVOS DO CLIENTE (termos anunciados) =====\n{texto_anuncios}"
+        partes_perfil.append(f"===== ANÚNCIOS ATIVOS DO CLIENTE (termos anunciados) =====\n{texto_anuncios}")
+    perfil = "\n\n".join(partes_perfil)
+
+    if not perfil.strip():
+        st.error(
+            "Não há briefing, site nem observações suficientes para avaliar esse cliente. "
+            "Preencha o site ou as observações do projeto e envie de novo."
+        )
+        st.stop()
     if len(perfil) > LIMITE_PERFIL:
         perfil = perfil[:LIMITE_PERFIL] + "\n[... perfil truncado para caber no limite da IA gratuita ...]"
 
