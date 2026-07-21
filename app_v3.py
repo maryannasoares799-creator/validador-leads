@@ -11,6 +11,14 @@ from datetime import date, datetime, timedelta
 
 import requests
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+
+# Cores de destaque no Excel por status
+FILL_DENTRO = PatternFill("solid", fgColor="C6EFCE")   # verde
+FILL_FORA = PatternFill("solid", fgColor="FFC7CE")     # vermelho
+FILL_ABERTO = PatternFill("solid", fgColor="FFEB9C")   # âmbar
+FILL_CABECALHO = PatternFill("solid", fgColor="0C447C")  # azul escuro
 
 # Provedores gratuitos (APIs compatíveis com OpenAI). O app escolhe automaticamente:
 # se houver CEREBRAS_API_KEY nos Secrets usa Cerebras (cota diária bem maior);
@@ -23,10 +31,23 @@ PROVEDORES = {
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "modelo": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "modelo": "meta-llama/llama-4-scout-17b-16e-instruct",   # modelo válido (não descontinuado)
         "chave": "GROQ_API_KEY",
     },
 }
+
+# Opções do seletor de IA na tela. Cada opção fixa um provedor + modelo.
+# "Automático" usa o provedor com chave configurada (Cerebras primeiro) no modelo padrão.
+# Cerebras tem cota diária muito maior (1M tokens/dia) — melhor para uso intenso.
+MODELOS_ESCOLHA = {
+    "Automático (recomendado)": None,
+    "Rápido · Cerebras Llama 3.1 8B": ("cerebras", "llama3.1-8b"),
+    "Rápido · Groq GPT-OSS 20B": ("groq", "openai/gpt-oss-20b"),
+    "Equilíbrio · Cerebras Llama 3.3 70B": ("cerebras", "llama-3.3-70b"),
+    "Equilíbrio · Groq Llama 4 Scout": ("groq", "meta-llama/llama-4-scout-17b-16e-instruct"),
+    "Preciso · Groq GPT-OSS 120B": ("groq", "openai/gpt-oss-120b"),
+}
+
 TAMANHO_LOTE = 20
 MAX_TENTATIVAS = 5
 LIMITE_FONTE = 4000
@@ -77,7 +98,7 @@ def carregar_historico():
         return []
 
 
-def salvar_no_historico(registro, csv_bytes=None, dash_bytes=None):
+def salvar_no_historico(registro, xlsx_bytes=None, dash_bytes=None):
     historico = carregar_historico()
     historico.insert(0, registro)
     historico = historico[:200]
@@ -86,9 +107,9 @@ def salvar_no_historico(registro, csv_bytes=None, dash_bytes=None):
             json.dump(historico, f, ensure_ascii=False)
         os.makedirs(PASTA_RESULTADOS, exist_ok=True)
         rid = registro.get("id", "")
-        if rid and csv_bytes:
-            with open(os.path.join(PASTA_RESULTADOS, f"{rid}.csv"), "wb") as f:
-                f.write(csv_bytes)
+        if rid and xlsx_bytes:
+            with open(os.path.join(PASTA_RESULTADOS, f"{rid}.xlsx"), "wb") as f:
+                f.write(xlsx_bytes)
         if rid and dash_bytes:
             with open(os.path.join(PASTA_RESULTADOS, f"{rid}.html"), "wb") as f:
                 f.write(dash_bytes)
@@ -101,7 +122,7 @@ def excluir_do_historico(rid):
     try:
         with open(ARQUIVO_HISTORICO, "w", encoding="utf-8") as f:
             json.dump(historico, f, ensure_ascii=False)
-        for ext in (".csv", ".html"):
+        for ext in (".csv", ".xlsx", ".html"):
             caminho = os.path.join(PASTA_RESULTADOS, f"{rid}{ext}")
             if os.path.exists(caminho):
                 os.remove(caminho)
@@ -262,6 +283,12 @@ MODELO_DASH = """<!DOCTYPE html>
   .paineis { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .painel { padding: 18px; }
   .painel h2 { font-size: 14px; color: #ffffff; margin-bottom: 12px; }
+  .painel h2 .pin { font-size: 11px; padding: 2px 8px; border-radius: 20px; vertical-align: middle; margin-left: 6px; }
+  .pin-verde { background: rgba(159,225,165,0.25); color: #C6EFCE; }
+  .pin-verm { background: rgba(245,169,169,0.25); color: #F5A9A9; }
+  .tab-leads { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .tab-leads th { text-align: left; color: #B5D4F4; font-weight: 600; padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.2); }
+  .tab-leads td { padding: 5px 6px; border-bottom: 1px solid rgba(255,255,255,0.1); color: #EAF3FC; }
   .rodape { text-align: center; color: rgba(234,243,252,0.6); font-size: 11px; margin-top: 18px; }
   @media (max-width: 700px) { .paineis { grid-template-columns: 1fr; } }
 </style>
@@ -294,6 +321,31 @@ MODELO_DASH = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="paineis" style="margin-top:12px;">
+    <div class="painel vidro">
+      <h2>Melhores leads <span class="pin pin-verde">dentro do foco</span></h2>
+      <table class="tab-leads">
+        <tr><th>ID</th><th>Nome</th><th>E-mail</th></tr>
+        __LINHAS_MELHORES__
+      </table>
+    </div>
+    <div class="painel vidro">
+      <h2>Piores leads <span class="pin pin-verm">fora do foco</span></h2>
+      <table class="tab-leads">
+        <tr><th>ID</th><th>Nome</th><th>E-mail</th></tr>
+        __LINHAS_PIORES__
+      </table>
+    </div>
+  </div>
+
+  <div class="painel vidro" style="margin-top:12px;">
+    <h2>Anúncios de origem que mais geraram leads fora do foco</h2>
+    <table class="tab-leads">
+      <tr><th>Anúncio de origem</th><th style="text-align:center;">Leads fora do foco</th></tr>
+      __LINHAS_ANUNCIOS__
+    </table>
+  </div>
+
   <p class="rodape">Validador de Leads · Soluções Industriais · uso interno</p>
 </div>
 <script>
@@ -322,9 +374,58 @@ new Chart(document.getElementById("barras"), {
 </html>"""
 
 
-def gerar_dashboard_html(empresa, chave, periodo, total, contagem):
+def gerar_xlsx(cabecalho, registros, leads, classificacoes):
+    """Gera um Excel com as colunas originais + STATUS + MOTIVO, pintando cada
+    linha por status: verde (dentro), vermelho (fora), âmbar (aberto)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Leads validados"
+    colunas = cabecalho + ["STATUS", "MOTIVO"]
+    ws.append(colunas)
+    for cel in ws[1]:
+        cel.fill = FILL_CABECALHO
+        cel.font = Font(color="FFFFFF", bold=True)
+    for i, r in enumerate(registros):
+        c = classificacoes.get(leads[i]["id"], {
+            "status": "Aberto", "motivo": "Não classificado pela IA — revisar manualmente.",
+        })
+        linha = list(r) + [c["status"], c["motivo"]]
+        ws.append(linha)
+        fill = {"Dentro do foco": FILL_DENTRO, "Fora do foco": FILL_FORA}.get(c["status"], FILL_ABERTO)
+        for cel in ws[ws.max_row]:
+            cel.fill = fill
+    # larguras aproximadas para leitura
+    for col in ws.columns:
+        larg = min(60, max(12, max((len(str(c.value)) if c.value else 0) for c in col) + 2))
+        ws.column_dimensions[col[0].column_letter].width = larg
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def gerar_dashboard_html(empresa, chave, periodo, total, contagem,
+                         melhores=None, piores=None, anuncios_ruins=None):
     def pct(n):
         return str(round(100 * n / total)) if total else "0"
+
+    def linhas_leads(lista):
+        if not lista:
+            return "<tr><td colspan='3' style='color:rgba(234,243,252,0.6);'>Nenhum lead nesta categoria.</td></tr>"
+        out = ""
+        for ld in lista:
+            out += (f"<tr><td>{ld['id']}</td><td>{ld['nome']}</td>"
+                    f"<td style='font-size:11px;'>{ld['email']}</td></tr>")
+        return out
+
+    def linhas_anuncios(lista):
+        if not lista:
+            return "<tr><td colspan='2' style='color:rgba(234,243,252,0.6);'>Sem dados de anúncio.</td></tr>"
+        out = ""
+        for nome, qtd in lista:
+            out += f"<tr><td>{nome}</td><td style='text-align:center; color:#F5A9A9;'>{qtd}</td></tr>"
+        return out
+
     html = MODELO_DASH
     trocas = {
         "__EMPRESA__": empresa,
@@ -338,6 +439,9 @@ def gerar_dashboard_html(empresa, chave, periodo, total, contagem):
         "__N_DENTRO__": str(contagem["Dentro do foco"]),
         "__N_FORA__": str(contagem["Fora do foco"]),
         "__N_ABERTO__": str(contagem["Aberto"]),
+        "__LINHAS_MELHORES__": linhas_leads(melhores),
+        "__LINHAS_PIORES__": linhas_leads(piores),
+        "__LINHAS_ANUNCIOS__": linhas_anuncios(anuncios_ruins),
     }
     for k, v in trocas.items():
         html = html.replace(k, v)
@@ -351,8 +455,9 @@ def provedores_ativos():
     return [n for n in ("cerebras", "groq") if secret(PROVEDORES[n]["chave"])]
 
 
-def chamar_ia(perfil, lote, ordem):
-    """Tenta os provedores da lista em ordem; troca de provedor se a cota diária estourar."""
+def chamar_ia(perfil, lote, ordem, modelo_forcado=None):
+    """Tenta os provedores da lista em ordem; troca de provedor se a cota diária estourar.
+    `ordem` é uma lista de nomes de provedor; `modelo_forcado` opcionalmente fixa o modelo."""
     leads_texto = "\n\n".join(
         f"LEAD id={l['id']}\nMensagem: {l['mensagem']}\nContexto extra: {l['extra']}"
         for l in lote
@@ -360,11 +465,13 @@ def chamar_ia(perfil, lote, ordem):
     conteudo_user = f"PERFIL DO CLIENTE:\n{perfil}\n\nLEADS A CLASSIFICAR:\n{leads_texto}"
     ultima = None
     esgotados = []
-    for nome in ordem:
+    for i, nome in enumerate(ordem):
         cfg = PROVEDORES[nome]
         api_key = secret(cfg["chave"])
+        # modelo fixo vale só para o provedor escolhido (1º da lista); reservas usam o padrão deles
+        modelo = modelo_forcado if (modelo_forcado and i == 0) else cfg["modelo"]
         corpo = {
-            "model": cfg["modelo"],
+            "model": modelo,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -377,6 +484,9 @@ def chamar_ia(perfil, lote, ordem):
             try:
                 r = requests.post(cfg["url"], json=corpo,
                                   headers={"Authorization": f"Bearer {api_key}"}, timeout=120)
+                if r.status_code in (400, 404) and corpo["model"] != cfg["modelo"]:
+                    corpo["model"] = cfg["modelo"]      # modelo escolhido não existe aqui: usa o padrão
+                    continue
                 if r.status_code == 429 or r.status_code >= 500:
                     try:
                         espera = float(r.headers.get("retry-after", 0))
@@ -478,7 +588,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-CAMPOS_FORM = ("f_chave", "f_site", "f_obs")
+CAMPOS_FORM = ("f_chave", "f_site", "f_obs", "f_modelo")
 if st.session_state.pop("limpar_form", False):
     for k in CAMPOS_FORM:
         st.session_state.pop(k, None)
@@ -500,6 +610,13 @@ obs = st.text_area(
     "Outras observações (opcional, mas importante quando não há briefing cadastrado)",
     placeholder="Ex.: cliente só vende máquinas (serviço, assistência, aluguel e peças = fora do foco); lote mínimo 500 peças; atende só Sul e Sudeste.",
     height=90, key="f_obs",
+)
+modelo_escolha = st.selectbox(
+    "Modelo de IA",
+    list(MODELOS_ESCOLHA.keys()),
+    key="f_modelo",
+    help="Rápido = resposta mais veloz, boa para o dia a dia. Preciso = mais lento, "
+         "melhor em casos sutis. Automático usa o provedor com maior cota disponível.",
 )
 
 
@@ -529,9 +646,24 @@ if validar:
         st.error("Preencha a chave única do cliente.")
         st.stop()
 
+    # Traduz a escolha do seletor em ordem de provedores + modelo fixo (se houver)
+    modelo_forcado = None
+    escolha = MODELOS_ESCOLHA.get(modelo_escolha)
+    if escolha:
+        prov, modelo_forcado = escolha
+        if prov not in ordem_ia:
+            st.error(f"O modelo escolhido usa {prov.title()}, mas não há chave desse provedor nos Secrets. "
+                     "Escolha outro modelo ou adicione a chave.")
+            st.stop()
+        ordem_ia = [prov] + [p for p in ordem_ia if p != prov]   # escolhido primeiro, resto como reserva
+
     nomes_ia = {"cerebras": "Cerebras", "groq": "Groq"}
-    st.caption("IA: " + " → ".join(nomes_ia[n] for n in ordem_ia)
-               + (" (reserva automática)" if len(ordem_ia) > 1 else ""))
+    if modelo_forcado:
+        st.caption(f"IA: {modelo_escolha}"
+                   + (f" · reserva: {nomes_ia[ordem_ia[1]]}" if len(ordem_ia) > 1 else ""))
+    else:
+        st.caption("IA: " + " → ".join(nomes_ia[n] for n in ordem_ia)
+                   + (" (reserva automática)" if len(ordem_ia) > 1 else ""))
 
     # 1. Briefing (question 286 — por chave única). Nem todo cliente tem briefing cadastrado.
     with st.spinner("Buscando briefing no Metabase..."):
@@ -622,8 +754,23 @@ if validar:
         st.error(f'Coluna "{col_msg}" não encontrada no retorno do Metabase. Colunas: {", ".join(cabecalho)}')
         st.stop()
     idx_msg = cabecalho.index(col_msg)
+
+    def idx_de(*nomes):
+        for n in nomes:
+            if n in cabecalho:
+                return cabecalho.index(n)
+        return -1
+
+    idx_id = idx_de("ID do Orçamento", "ID do Orcamento")
+    idx_nome = idx_de("Nome do Comprador", "Nome do comprador")
+    idx_email = idx_de("E-mail do Comprador", "Email do Comprador", "E-mail do comprador")
+    idx_anuncio = idx_de("anúncio de origem do Orçamento", "Anúncio do cliente", "anuncio de origem do Orçamento")
+
     registros = [r for r in linhas[1:] if any(c.strip() for c in r)]
     st.info(f"{len(registros)} leads encontrados de {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}.")
+
+    def celula(r, idx):
+        return r[idx].strip() if 0 <= idx < len(r) else ""
 
     leads = []
     for i, r in enumerate(registros):
@@ -631,7 +778,16 @@ if validar:
             f"{cabecalho[j]}: {r[j]}" for j in range(len(cabecalho))
             if j != idx_msg and j < len(r) and r[j].strip()
         )[:500]
-        leads.append({"id": f"L{i+2}", "mensagem": r[idx_msg] if idx_msg < len(r) else "", "extra": extra})
+        leads.append({
+            "id": f"L{i+2}",
+            "mensagem": r[idx_msg] if idx_msg < len(r) else "",
+            "extra": extra,
+            "id_orc": celula(r, idx_id) or f"linha {i+2}",
+            "nome": celula(r, idx_nome) or "(sem nome)",
+            "email": celula(r, idx_email) or "(sem e-mail)",
+            "anuncio": celula(r, idx_anuncio) or "(sem anúncio)",
+            "tam_msg": len(celula(r, idx_msg)),
+        })
 
     # 6. Classificação com re-tentativas
     classificacoes = {}
@@ -643,7 +799,7 @@ if validar:
         for n in range(total_lotes):
             lote = lista[n * tamanho_lote:(n + 1) * tamanho_lote]
             try:
-                resultado = chamar_ia(perfil, lote, ordem_ia)
+                resultado = chamar_ia(perfil, lote, ordem_ia, modelo_forcado)
             except RuntimeError as e:
                 progresso.empty()
                 st.error(str(e))       # cota diária esgotada: para tudo na hora
@@ -675,22 +831,35 @@ if validar:
         processar(pendentes, 1, "Última passada")
     falhas = sum(1 for l in leads if l["id"] not in classificacoes)
 
-    # 7. CSV final + resumo
-    saida = io.StringIO()
-    w = csv.writer(saida)
-    w.writerow(cabecalho + ["STATUS", "MOTIVO"])
+    # 7. Contagem + rankings para o dashboard
     contagem = {"Dentro do foco": 0, "Fora do foco": 0, "Aberto": 0}
-    for i, r in enumerate(registros):
-        c = classificacoes.get(leads[i]["id"], {
-            "status": "Aberto", "motivo": "Não classificado pela IA — revisar manualmente.",
-        })
-        contagem[c["status"]] += 1
-        w.writerow(r + [c["status"], c["motivo"]])
+    for i in range(len(registros)):
+        c = classificacoes.get(leads[i]["id"])
+        status = c["status"] if c else "Aberto"
+        contagem[status] += 1
+        leads[i]["status"] = status
+
+    dentro = [l for l in leads if l.get("status") == "Dentro do foco"]
+    fora = [l for l in leads if l.get("status") == "Fora do foco"]
+    # melhores = dentro do foco com mensagem mais específica (mais longa) primeiro
+    melhores = sorted(dentro, key=lambda l: l["tam_msg"], reverse=True)[:10]
+    melhores = [{"id": l["id_orc"], "nome": l["nome"], "email": l["email"]} for l in melhores]
+    piores = fora[:10]
+    piores = [{"id": l["id_orc"], "nome": l["nome"], "email": l["email"]} for l in piores]
+    # anúncios que mais geraram leads fora do foco
+    cont_anuncios = {}
+    for l in fora:
+        cont_anuncios[l["anuncio"]] = cont_anuncios.get(l["anuncio"], 0) + 1
+    anuncios_ruins = sorted(cont_anuncios.items(), key=lambda x: x[1], reverse=True)[:8]
+
+    # 8. Excel com destaque + dashboard
+    xlsx_bytes = gerar_xlsx(cabecalho, registros, leads, classificacoes)
 
     total = len(registros)
     periodo_txt = f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
     base_nome = f"{nome_empresa} - {data_inicio.isoformat()} a {data_fim.isoformat()}"
-    dash_html = gerar_dashboard_html(nome_empresa, chave_unica.strip(), periodo_txt, total, contagem)
+    dash_html = gerar_dashboard_html(nome_empresa, chave_unica.strip(), periodo_txt, total, contagem,
+                                     melhores=melhores, piores=piores, anuncios_ruins=anuncios_ruins)
 
     # Resultado fica guardado na sessão: os downloads não somem ao clicar
     st.session_state["resultado"] = {
@@ -699,8 +868,8 @@ if validar:
         "contagem": contagem,
         "falhas": falhas,
         "erro_ia": erros_ia[-1] if erros_ia else "",
-        "csv_bytes": saida.getvalue().encode("utf-8-sig"),
-        "csv_nome": f"{base_nome} - Validado.csv",
+        "xlsx_bytes": xlsx_bytes,
+        "xlsx_nome": f"{base_nome} - Validado.xlsx",
         "dash_bytes": dash_html.encode("utf-8"),
         "dash_nome": f"{base_nome} - Dashboard.html",
     }
@@ -715,9 +884,9 @@ if validar:
         "Dentro do foco": contagem["Dentro do foco"],
         "Fora do foco": contagem["Fora do foco"],
         "Aberto": contagem["Aberto"],
-        "csv_nome": f"{base_nome} - Validado.csv",
+        "xlsx_nome": f"{base_nome} - Validado.xlsx",
         "dash_nome": f"{base_nome} - Dashboard.html",
-    }, csv_bytes=st.session_state["resultado"]["csv_bytes"],
+    }, xlsx_bytes=xlsx_bytes,
        dash_bytes=st.session_state["resultado"]["dash_bytes"])
 
 res = st.session_state.get("resultado")
@@ -735,9 +904,10 @@ if res:
 
     col_dl1, col_dl2 = st.columns(2)
     with col_dl1:
-        st.download_button("Baixar CSV validado", data=res["csv_bytes"],
-                           file_name=res["csv_nome"], mime="text/csv",
-                           use_container_width=True, key="dl_csv")
+        st.download_button("Baixar Excel validado", data=res["xlsx_bytes"],
+                           file_name=res["xlsx_nome"],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True, key="dl_xlsx")
     with col_dl2:
         st.download_button("Baixar dashboard (HTML)", data=res["dash_bytes"],
                            file_name=res["dash_nome"], mime="text/html",
@@ -798,16 +968,17 @@ if historico:
         escolha = st.selectbox("Selecione a validação", list(rotulos.keys()), label_visibility="collapsed")
         sel = rotulos[escolha]
         rid = sel["id"]
-        csv_salvo = ler_resultado_salvo(rid, ".csv")
+        xlsx_salvo = ler_resultado_salvo(rid, ".xlsx")
         dash_salvo = ler_resultado_salvo(rid, ".html")
         cg1, cg2 = st.columns(2)
         with cg1:
-            if csv_salvo:
-                st.download_button("Baixar CSV", data=csv_salvo,
-                                   file_name=sel.get("csv_nome", f"{rid}.csv"),
-                                   mime="text/csv", use_container_width=True, key=f"hcsv_{rid}")
+            if xlsx_salvo:
+                st.download_button("Baixar Excel", data=xlsx_salvo,
+                                   file_name=sel.get("xlsx_nome", f"{rid}.xlsx"),
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True, key=f"hxlsx_{rid}")
             else:
-                st.caption("CSV não disponível (app reiniciou)")
+                st.caption("Excel não disponível (app reiniciou)")
         with cg2:
             if dash_salvo:
                 st.download_button("Baixar dashboard", data=dash_salvo,
